@@ -24,6 +24,11 @@ const pendingLeads = new Map();
 // Queue for after-hours leads
 const morningQueue = [];
 
+// Queue for delayed leads (15-min wait)
+const delayedLeads = [];
+
+const CALL_DELAY_MS = 15 * 60 * 1000; // 15 minutes
+
 // --- Time helpers (PST/PDT aware) ---
 function getPSTDate() {
   return new Date(
@@ -91,7 +96,8 @@ function scheduleForMorning(lead) {
 }
 
 // ============================================================
-// 1. TRIGGER ENDPOINT — called by Make.com after 15 min delay
+// 1. TRIGGER ENDPOINT — called by Make.com immediately
+//    Server handles the 15-minute delay before calling Rob
 // ============================================================
 app.post("/trigger-call", async (req, res) => {
   const { name, phone, email } = req.body;
@@ -101,10 +107,16 @@ app.post("/trigger-call", async (req, res) => {
   }
 
   const lead = { name, phone, email };
-  console.log(`[TRIGGER] New lead: ${name} | ${phone} | ${email}`);
+  const fireTime = new Date(Date.now() + CALL_DELAY_MS);
+  console.log(`[TRIGGER] New lead: ${name} | ${phone} | Calling at ${fireTime.toISOString()}`);
 
-  // Check business hours
+  // Check if call time (now + 15 min) will still be in business hours
+  const futureHour = new Date(
+    fireTime.toLocaleString("en-US", { timeZone: "America/Los_Angeles" })
+  ).getHours();
+
   if (!isBusinessHours()) {
+    // It's already after hours — queue for 10am
     scheduleForMorning(lead);
     const pstNow = getPSTDate();
     return res.json({
@@ -115,12 +127,38 @@ app.post("/trigger-call", async (req, res) => {
     });
   }
 
-  try {
-    const callSid = await dialRob(lead);
-    res.json({ success: true, callSid });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  if (futureHour >= 18) {
+    // 15 min from now would be after 6pm — queue for morning
+    scheduleForMorning(lead);
+    return res.json({
+      success: true,
+      queued: true,
+      reason: "Call would land after 6pm PST — queued for morning",
+      scheduledFor: "10:00 AM PST tomorrow",
+    });
   }
+
+  // Schedule the call with 15-min delay
+  delayedLeads.push({ lead, fireTime });
+
+  setTimeout(async () => {
+    console.log(`[DELAYED] 15 min up — calling Rob for ${lead.name}`);
+    try {
+      await dialRob(lead);
+    } catch (err) {
+      console.error(`[DELAYED ERROR] Failed to call for ${lead.name}:`, err.message);
+    }
+    // Remove from delayed queue
+    const idx = delayedLeads.findIndex((d) => d.lead === lead);
+    if (idx !== -1) delayedLeads.splice(idx, 1);
+  }, CALL_DELAY_MS);
+
+  res.json({
+    success: true,
+    delayed: true,
+    callIn: "15 minutes",
+    fireTime: fireTime.toISOString(),
+  });
 });
 
 // ============================================================
@@ -192,6 +230,11 @@ app.get("/queue", (req, res) => {
   res.json({
     currentPST: getPSTDate().toLocaleTimeString(),
     businessHours: isBusinessHours(),
+    delayedLeads: delayedLeads.map((d) => ({
+      name: d.lead.name,
+      phone: d.lead.phone,
+      firesAt: d.fireTime.toISOString(),
+    })),
     queuedForMorning: morningQueue.map((q) => ({
       name: q.lead.name,
       phone: q.lead.phone,
@@ -209,6 +252,7 @@ app.get("/", (req, res) => {
     currentPST: getPSTDate().toLocaleTimeString(),
     businessHours: isBusinessHours(),
     activeCalls: pendingLeads.size,
+    delayedLeads: delayedLeads.length,
     queuedForMorning: morningQueue.length,
   });
 });
