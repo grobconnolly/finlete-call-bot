@@ -27,6 +27,10 @@ const morningQueue = [];
 // Queue for delayed leads (15-min wait)
 const delayedLeads = [];
 
+// Dedup: track called numbers → timestamp (skip if called within 30 days)
+const calledNumbers = new Map(); // normalizedPhone → Date
+const DEDUP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
 const CALL_DELAY_MS = 15 * 60 * 1000; // 15 minutes
 
 // --- Time helpers (PST/PDT aware) ---
@@ -44,18 +48,48 @@ function isBusinessHours() {
 
 function msUntilNextMorning(targetHour = 10) {
   const now = new Date();
-  // Get current PST time
   const pst = new Date(
     now.toLocaleString("en-US", { timeZone: "America/Los_Angeles" })
   );
-  // Build target: next day at 10am PST
   const target = new Date(pst);
   target.setDate(target.getDate() + 1);
   target.setHours(targetHour, 0, 0, 0);
-  // Calculate ms difference (account for UTC offset)
-  const pstOffset = pst.getTime() - now.getTime();
   return target.getTime() - pst.getTime();
 }
+
+// --- Dedup helper ---
+function normalizePhone(phone) {
+  return (phone || "").replace(/\D/g, "");
+}
+
+function isDuplicate(phone) {
+  const normalized = normalizePhone(phone);
+  const lastCalled = calledNumbers.get(normalized);
+  if (!lastCalled) return { duplicate: false };
+  const elapsed = Date.now() - lastCalled.getTime();
+  if (elapsed < DEDUP_WINDOW_MS) {
+    const daysAgo = Math.floor(elapsed / (1000 * 60 * 60 * 24));
+    return { duplicate: true, daysAgo };
+  }
+  return { duplicate: false };
+}
+
+function recordCall(phone) {
+  calledNumbers.set(normalizePhone(phone), new Date());
+}
+
+// --- Cleanup expired dedup entries (runs every hour) ---
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [phone, date] of calledNumbers) {
+    if (now - date.getTime() >= DEDUP_WINDOW_MS) {
+      calledNumbers.delete(phone);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) console.log(`[CLEANUP] Removed ${cleaned} expired dedup entries`);
+}, 60 * 60 * 1000);
 
 async function dialRob(lead) {
   try {
@@ -67,6 +101,7 @@ async function dialRob(lead) {
     });
 
     pendingLeads.set(call.sid, lead);
+    recordCall(lead.phone); // Track for dedup
     console.log(`[CALL] Initiated call ${call.sid} to Rob for lead: ${lead.name}`);
     return call.sid;
   } catch (err) {
@@ -89,7 +124,6 @@ function scheduleForMorning(lead) {
     } catch (err) {
       console.error(`[MORNING ERROR] Failed to call for ${lead.name}:`, err.message);
     }
-    // Remove from queue
     const idx = morningQueue.findIndex((q) => q.lead === lead);
     if (idx !== -1) morningQueue.splice(idx, 1);
   }, delay);
@@ -107,6 +141,18 @@ app.post("/trigger-call", async (req, res) => {
   }
 
   const lead = { name, phone, email };
+
+  // --- Dedup check ---
+  const { duplicate, daysAgo } = isDuplicate(phone);
+  if (duplicate) {
+    console.log(`[DEDUP] Skipping ${name} (${phone}) — already called ${daysAgo} days ago`);
+    return res.json({
+      success: true,
+      skipped: true,
+      reason: `Already called ${daysAgo} days ago`,
+    });
+  }
+
   const fireTime = new Date(Date.now() + CALL_DELAY_MS);
   console.log(`[TRIGGER] New lead: ${name} | ${phone} | Calling at ${fireTime.toISOString()}`);
 
@@ -116,7 +162,6 @@ app.post("/trigger-call", async (req, res) => {
   ).getHours();
 
   if (!isBusinessHours()) {
-    // It's already after hours — queue for 10am
     scheduleForMorning(lead);
     const pstNow = getPSTDate();
     return res.json({
@@ -128,7 +173,6 @@ app.post("/trigger-call", async (req, res) => {
   }
 
   if (futureHour >= 18) {
-    // 15 min from now would be after 6pm — queue for morning
     scheduleForMorning(lead);
     return res.json({
       success: true,
@@ -148,7 +192,6 @@ app.post("/trigger-call", async (req, res) => {
     } catch (err) {
       console.error(`[DELAYED ERROR] Failed to call for ${lead.name}:`, err.message);
     }
-    // Remove from delayed queue
     const idx = delayedLeads.findIndex((d) => d.lead === lead);
     if (idx !== -1) delayedLeads.splice(idx, 1);
   }, CALL_DELAY_MS);
@@ -183,7 +226,6 @@ app.post("/voice-connect", (req, res) => {
     `New Finlete lead: ${leadName}. Press 1 to connect. Press 2 to skip.`
   );
 
-  // If no input, hang up
   twiml.say("No input received. Goodbye.");
 
   res.type("text/xml");
@@ -216,7 +258,6 @@ app.post("/bridge-call", (req, res) => {
     console.log(`[SKIP] Rob skipped lead: ${lead?.name}`);
   }
 
-  // Clean up
   pendingLeads.delete(callSid);
 
   res.type("text/xml");
@@ -224,7 +265,7 @@ app.post("/bridge-call", (req, res) => {
 });
 
 // ============================================================
-// Queue inspection — see what's waiting for morning
+// Queue + dedup inspection
 // ============================================================
 app.get("/queue", (req, res) => {
   res.json({
@@ -240,6 +281,11 @@ app.get("/queue", (req, res) => {
       phone: q.lead.phone,
       scheduledFor: q.fireTime.toISOString(),
     })),
+    recentlyCalled: Array.from(calledNumbers.entries()).map(([phone, date]) => ({
+      phone,
+      calledAt: date.toISOString(),
+      daysAgo: Math.floor((Date.now() - date.getTime()) / (1000 * 60 * 60 * 24)),
+    })),
   });
 });
 
@@ -254,6 +300,7 @@ app.get("/", (req, res) => {
     activeCalls: pendingLeads.size,
     delayedLeads: delayedLeads.length,
     queuedForMorning: morningQueue.length,
+    trackedNumbers: calledNumbers.size,
   });
 });
 
