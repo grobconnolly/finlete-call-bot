@@ -32,7 +32,7 @@ const CALL_DELAY_MS = 15 * 60 * 1000; // 15 minutes
 // Only one call to Rob at a time. Next call fires after
 // the current one completes (answered, skipped, or no answer).
 // ============================================================
-const callQueue = [];       // Array of { lead, fireTime }
+const callQueue = [];       // Array of { lead, queuedAt }
 let activeCallSid = null;   // Currently ringing/in-progress call
 let processing = false;     // Lock to prevent double-processing
 
@@ -312,6 +312,23 @@ app.post("/bridge-call", (req, res) => {
     twiml.say("Skipped. Goodbye.");
     console.log(`[SKIP] Rob skipped lead: ${lead?.name}`);
   }
+
+  res.type("text/xml");
+  res.send(twiml.toString());
+});
+
+// ============================================================
+// 4. INBOUND CALLS — forward to Rob's cell
+// ============================================================
+app.post("/inbound", (req, res) => {
+  const from = req.body.From || "Unknown";
+  console.log(`[INBOUND] Incoming call from ${from} — forwarding to Rob`);
+
+  const twiml = new VoiceResponse();
+  twiml.dial(
+    { callerId: req.body.From, timeout: 30 },
+    ROB_CELL_NUMBER
+  );
 
   res.type("text/xml");
   res.send(twiml.toString());
