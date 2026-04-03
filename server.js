@@ -21,17 +21,98 @@ const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 // In-memory store for pending leads (keyed by Twilio CallSid)
 const pendingLeads = new Map();
 
-// Queue for after-hours leads
-const morningQueue = [];
-
-// Queue for delayed leads (15-min wait)
-const delayedLeads = [];
-
 // Dedup: track called numbers → timestamp (skip if called within 30 days)
 const calledNumbers = new Map(); // normalizedPhone → Date
 const DEDUP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 const CALL_DELAY_MS = 15 * 60 * 1000; // 15 minutes
+
+// ============================================================
+// SEQUENTIAL CALL QUEUE
+// Only one call to Rob at a time. Next call fires after
+// the current one completes (answered, skipped, or no answer).
+// ============================================================
+const callQueue = [];       // Array of { lead, fireTime }
+let activeCallSid = null;   // Currently ringing/in-progress call
+let processing = false;     // Lock to prevent double-processing
+
+// 2-minute safety timeout — if Twilio status callback never fires,
+// move on to the next call anyway
+let safetyTimer = null;
+const SAFETY_TIMEOUT_MS = 2 * 60 * 1000;
+
+function enqueueCall(lead) {
+  callQueue.push({ lead, queuedAt: new Date() });
+  console.log(`[QUEUE] Added ${lead.name} (${lead.phone}) — ${callQueue.length} in queue`);
+  processQueue();
+}
+
+async function processQueue() {
+  if (processing || activeCallSid) return; // Already on a call
+  if (callQueue.length === 0) return;      // Nothing to do
+
+  processing = true;
+  const { lead } = callQueue.shift();
+
+  try {
+    const call = await client.calls.create({
+      to: ROB_CELL_NUMBER,
+      from: TWILIO_PHONE_NUMBER,
+      url: `${BASE_URL}/voice-connect`,
+      method: "POST",
+      statusCallback: `${BASE_URL}/call-status`,
+      statusCallbackEvent: ["completed"],
+      statusCallbackMethod: "POST",
+    });
+
+    activeCallSid = call.sid;
+    pendingLeads.set(call.sid, lead);
+    console.log(`[CALL] Initiated call ${call.sid} to Rob for lead: ${lead.name} (${lead.phone})`);
+
+    // Safety timeout in case status callback never fires
+    safetyTimer = setTimeout(() => {
+      console.log(`[SAFETY] Timeout — clearing active call for ${lead.name}`);
+      activeCallSid = null;
+      processing = false;
+      processQueue();
+    }, SAFETY_TIMEOUT_MS);
+
+  } catch (err) {
+    console.error(`[ERROR] Twilio call failed for ${lead.name}:`, err.message);
+    activeCallSid = null;
+  }
+
+  processing = false;
+}
+
+// ============================================================
+// CALL STATUS CALLBACK — Twilio tells us the call is done
+// ============================================================
+app.post("/call-status", (req, res) => {
+  const callSid = req.body.CallSid;
+  const status = req.body.CallStatus; // completed, busy, no-answer, failed, canceled
+
+  console.log(`[STATUS] Call ${callSid} ended with status: ${status}`);
+
+  // Clear safety timer
+  if (safetyTimer) {
+    clearTimeout(safetyTimer);
+    safetyTimer = null;
+  }
+
+  // Clean up
+  pendingLeads.delete(callSid);
+  activeCallSid = null;
+
+  // Process next call in queue
+  const remaining = callQueue.length;
+  if (remaining > 0) {
+    console.log(`[QUEUE] ${remaining} calls remaining — dialing next in 5 seconds`);
+    setTimeout(() => processQueue(), 5000); // 5-second breather between calls
+  }
+
+  res.sendStatus(200);
+});
 
 // --- Time helpers (PST/PDT aware) ---
 function getPSTDate() {
@@ -91,23 +172,8 @@ setInterval(() => {
   if (cleaned > 0) console.log(`[CLEANUP] Removed ${cleaned} expired dedup entries`);
 }, 60 * 60 * 1000);
 
-async function dialRob(lead) {
-  try {
-    const call = await client.calls.create({
-      to: ROB_CELL_NUMBER,
-      from: TWILIO_PHONE_NUMBER,
-      url: `${BASE_URL}/voice-connect`,
-      method: "POST",
-    });
-
-    pendingLeads.set(call.sid, lead);
-    console.log(`[CALL] Initiated call ${call.sid} to Rob for lead: ${lead.name}`);
-    return call.sid;
-  } catch (err) {
-    console.error("[ERROR] Twilio call failed:", err.message);
-    throw err;
-  }
-}
+// Morning queue — leads that came in after hours
+const morningQueue = [];
 
 function scheduleForMorning(lead) {
   const delay = msUntilNextMorning(10);
@@ -116,21 +182,16 @@ function scheduleForMorning(lead) {
 
   console.log(`[QUEUED] ${lead.name} queued for 10am PST (fires at ${fireTime.toISOString()})`);
 
-  setTimeout(async () => {
-    console.log(`[MORNING] Firing queued call for ${lead.name}`);
-    try {
-      await dialRob(lead);
-    } catch (err) {
-      console.error(`[MORNING ERROR] Failed to call for ${lead.name}:`, err.message);
-    }
+  setTimeout(() => {
+    console.log(`[MORNING] Adding ${lead.name} to call queue`);
+    enqueueCall(lead); // Goes into sequential queue, not direct dial
     const idx = morningQueue.findIndex((q) => q.lead === lead);
     if (idx !== -1) morningQueue.splice(idx, 1);
   }, delay);
 }
 
 // ============================================================
-// 1. TRIGGER ENDPOINT — called by Make.com immediately
-//    Server handles the 15-minute delay before calling Rob
+// 1. TRIGGER ENDPOINT — called by Make.com
 // ============================================================
 app.post("/trigger-call", async (req, res) => {
   const { name, phone, email } = req.body;
@@ -158,7 +219,7 @@ app.post("/trigger-call", async (req, res) => {
   const fireTime = new Date(Date.now() + CALL_DELAY_MS);
   console.log(`[TRIGGER] New lead: ${lead.name} | ${phone} | Calling at ${fireTime.toISOString()}`);
 
-  // Check if call time (now + 15 min) will still be in business hours
+  // Check business hours
   const futureHour = new Date(
     fireTime.toLocaleString("en-US", { timeZone: "America/Los_Angeles" })
   ).getHours();
@@ -184,18 +245,10 @@ app.post("/trigger-call", async (req, res) => {
     });
   }
 
-  // Schedule the call with 15-min delay
-  delayedLeads.push({ lead, fireTime });
-
-  setTimeout(async () => {
-    console.log(`[DELAYED] 15 min up — calling Rob for ${lead.name}`);
-    try {
-      await dialRob(lead);
-    } catch (err) {
-      console.error(`[DELAYED ERROR] Failed to call for ${lead.name}:`, err.message);
-    }
-    const idx = delayedLeads.findIndex((d) => d.lead === lead);
-    if (idx !== -1) delayedLeads.splice(idx, 1);
+  // Schedule the call with 15-min delay, then into sequential queue
+  setTimeout(() => {
+    console.log(`[DELAYED] 15 min up — adding ${lead.name} to call queue`);
+    enqueueCall(lead);
   }, CALL_DELAY_MS);
 
   res.json({
@@ -260,23 +313,24 @@ app.post("/bridge-call", (req, res) => {
     console.log(`[SKIP] Rob skipped lead: ${lead?.name}`);
   }
 
-  pendingLeads.delete(callSid);
-
   res.type("text/xml");
   res.send(twiml.toString());
 });
 
 // ============================================================
-// Queue + dedup inspection
+// Queue inspection
 // ============================================================
 app.get("/queue", (req, res) => {
   res.json({
     currentPST: getPSTDate().toLocaleTimeString(),
     businessHours: isBusinessHours(),
-    delayedLeads: delayedLeads.map((d) => ({
-      name: d.lead.name,
-      phone: d.lead.phone,
-      firesAt: d.fireTime.toISOString(),
+    activeCall: activeCallSid
+      ? { callSid: activeCallSid, lead: pendingLeads.get(activeCallSid) }
+      : null,
+    callQueue: callQueue.map((q) => ({
+      name: q.lead.name,
+      phone: q.lead.phone,
+      queuedAt: q.queuedAt.toISOString(),
     })),
     queuedForMorning: morningQueue.map((q) => ({
       name: q.lead.name,
@@ -299,8 +353,8 @@ app.get("/", (req, res) => {
     status: "Finlete Call Bot running",
     currentPST: getPSTDate().toLocaleTimeString(),
     businessHours: isBusinessHours(),
-    activeCalls: pendingLeads.size,
-    delayedLeads: delayedLeads.length,
+    activeCall: !!activeCallSid,
+    callQueueLength: callQueue.length,
     queuedForMorning: morningQueue.length,
     trackedNumbers: calledNumbers.size,
   });
