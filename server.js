@@ -57,7 +57,7 @@ function msUntilNextMorning(targetHour = 10) {
   return target.getTime() - pst.getTime();
 }
 
-// --- Dedup helper ---
+// --- Dedup helpers ---
 function normalizePhone(phone) {
   return (phone || "").replace(/\D/g, "");
 }
@@ -101,7 +101,6 @@ async function dialRob(lead) {
     });
 
     pendingLeads.set(call.sid, lead);
-    recordCall(lead.phone); // Track for dedup
     console.log(`[CALL] Initiated call ${call.sid} to Rob for lead: ${lead.name}`);
     return call.sid;
   } catch (err) {
@@ -140,12 +139,12 @@ app.post("/trigger-call", async (req, res) => {
     return res.status(400).json({ error: "Missing lead phone number" });
   }
 
-  const lead = { name, phone, email };
+  const lead = { name: name || "Unknown", phone, email };
 
   // --- Dedup check ---
   const { duplicate, daysAgo } = isDuplicate(phone);
   if (duplicate) {
-    console.log(`[DEDUP] Skipping ${name} (${phone}) — already called ${daysAgo} days ago`);
+    console.log(`[DEDUP] Skipping ${lead.name} (${phone}) — already called ${daysAgo} days ago`);
     return res.json({
       success: true,
       skipped: true,
@@ -153,8 +152,11 @@ app.post("/trigger-call", async (req, res) => {
     });
   }
 
+  // Record IMMEDIATELY so subsequent triggers for the same number are blocked
+  recordCall(phone);
+
   const fireTime = new Date(Date.now() + CALL_DELAY_MS);
-  console.log(`[TRIGGER] New lead: ${name} | ${phone} | Calling at ${fireTime.toISOString()}`);
+  console.log(`[TRIGGER] New lead: ${lead.name} | ${phone} | Calling at ${fireTime.toISOString()}`);
 
   // Check if call time (now + 15 min) will still be in business hours
   const futureHour = new Date(
